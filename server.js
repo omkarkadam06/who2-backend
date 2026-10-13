@@ -240,6 +240,32 @@ io.on('connection', (socket) => {
         } catch (err) { console.error("Vote Error"); }
     });
 });
+// --- CRON: Daily Game Engine (Runs at 6:00 AM every day) ---
+cron.schedule('0 6 * * *', async () => {
+    console.log("Starting Daily Games...");
+    try {
+        // Find all groups that have at least 4 members
+        const groups = await Group.find({ 'members.3': { $exists: true } }); 
+        
+        for (let group of groups) {
+            // Shuffle members and pick 2 random shadows
+            let shuffled = [...group.members].sort(() => 0.5 - Math.random());
+            group.currentShadows = shuffled.slice(0, 2);
+            group.gameActive = true;
+            await group.save();
+            
+            // Notify the group in real-time
+            io.to(group._id.toString()).emit('receive_message', {
+                groupId: group._id,
+                senderName: "SYSTEM",
+                text: "The Daily Shadow Hunt has begun! 2 Shadows are hiding among you.",
+                createdAt: new Date()
+            });
+        }
+    } catch (err) {
+        console.error("Cron Job Error:", err);
+    }
+});
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`✅ WHO2 Backend API running on port ${PORT}`));
