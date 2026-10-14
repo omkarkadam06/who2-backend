@@ -46,6 +46,7 @@ const MessageSchema = new mongoose.Schema({
   groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group' },
   senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   senderName: String,
+  senderPic: { type: String, default: "" }, // Added for Group Chat Profile Pics
   text: String,
   image: { type: String, default: "" },
   fileUrl: { type: String, default: "" },
@@ -128,67 +129,49 @@ app.post('/api/auth/register', async (req, res) => {
     const { fullName, email, password } = req.body;
     if (await User.findOne({ email })) return res.status(400).json({ error: "Email already registered" });
     const hashedPassword = await bcrypt.hash(password, 10);
-    const user = await new User({ fullName, email, password: hashedPassword }).save();
+    await new User({ fullName, email, password: hashedPassword }).save();
     res.status(201).json({ message: "Registered successfully!" });
-  } catch (err) {
-    res.status(500).json({ error: "Server registration error" });
-  }
+  } catch (err) { res.status(500).json({ error: "Server registration error" }); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     const user = await User.findOne({ email });
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      return res.status(400).json({ error: "Invalid credentials" });
-    }
+    if (!user || !(await bcrypt.compare(password, user.password))) return res.status(400).json({ error: "Invalid credentials" });
+    
     const token = jwt.sign({ userId: user._id, name: user.fullName }, process.env.JWT_SECRET);
-    res.json({
-      token,
-      user: {
-        id: user._id,
-        name: user.fullName,
-        email: user.email,
-        profilePic: user.profilePic,
-        xp: user.xp,
-        streak: user.streak
-      }
-    });
-  } catch (err) {
-    res.status(500).json({ error: "Server login error" });
-  }
+    res.json({ token, user: { id: user._id, name: user.fullName, email: user.email, profilePic: user.profilePic, xp: user.xp, streak: user.streak } });
+  } catch (err) { res.status(500).json({ error: "Server login error" }); }
 });
 
 app.get('/api/profile', verifyToken, async (req, res) => {
-  const user = await User.findById(req.user.userId).select('-password');
-  res.json(user);
+  res.json(await User.findById(req.user.userId).select('-password'));
+});
+
+// NEW: Change Password API
+app.put('/api/profile/password', verifyToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const user = await User.findById(req.user.userId);
+    if (!(await bcrypt.compare(currentPassword, user.password))) {
+      return res.status(400).json({ error: "Incorrect current password" });
+    }
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+    res.json({ message: "Password updated successfully" });
+  } catch (err) { res.status(500).json({ error: "Failed to update password" }); }
 });
 
 app.put('/api/profile/picture', verifyToken, async (req, res) => {
   try {
-    const user = await User.findByIdAndUpdate(
-      req.user.userId,
-      { profilePic: req.body.profilePic },
-      { new: true }
-    ).select('-password');
+    const user = await User.findByIdAndUpdate(req.user.userId, { profilePic: req.body.profilePic }, { new: true }).select('-password');
     res.json(user);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to update profile picture" });
-  }
-});
-
-app.post('/api/user/fcm-token', verifyToken, async (req, res) => {
-  try {
-    await User.findByIdAndUpdate(req.user.userId, { fcmToken: req.body.fcmToken });
-    res.json({ message: "Token registered" });
-  } catch (err) {
-    res.status(500).json({ error: "Token registration error" });
-  }
+  } catch (err) { res.status(500).json({ error: "Failed to update profile picture" }); }
 });
 
 app.get('/api/users', verifyToken, async (req, res) => {
-  const users = await User.find({ _id: { $ne: req.user.userId } }).select('fullName email profilePic _id');
-  res.json(users);
+  res.json(await User.find({ _id: { $ne: req.user.userId } }).select('fullName email profilePic _id'));
 });
 
 // --- FEED & STORIES ---
@@ -200,46 +183,22 @@ app.get('/api/feed', verifyToken, async (req, res) => {
 
 app.post('/api/posts', verifyToken, async (req, res) => {
   const user = await User.findById(req.user.userId);
-  const post = await new Post({
-    authorId: user._id,
-    authorName: user.fullName,
-    authorPic: user.profilePic,
-    content: req.body.content,
-    image: req.body.image
-  }).save();
+  const post = await new Post({ authorId: user._id, authorName: user.fullName, authorPic: user.profilePic, content: req.body.content, image: req.body.image }).save();
   res.status(201).json(post);
 });
 
 app.post('/api/stories', verifyToken, async (req, res) => {
   const user = await User.findById(req.user.userId);
-  const story = await new Story({
-    authorId: user._id,
-    authorName: user.fullName,
-    authorPic: user.profilePic,
-    content: req.body.content,
-    image: req.body.image
-  }).save();
+  const story = await new Story({ authorId: user._id, authorName: user.fullName, authorPic: user.profilePic, content: req.body.content, image: req.body.image }).save();
   res.status(201).json(story);
 });
 
 app.post('/api/stories/:id/reply', verifyToken, async (req, res) => {
-  try {
-    const story = await Story.findById(req.params.id);
-    if (!story) return res.status(404).json({ error: "Story expired or not found" });
-    story.replies.push({ senderName: req.user.name, text: req.body.text });
-    await story.save();
-
-    // Auto-create a DM to the author
-    await new DirectMessage({
-      senderId: req.user.userId,
-      receiverId: story.authorId,
-      text: `Replied to story: ${req.body.text}`
-    }).save();
-
-    res.json(story);
-  } catch (err) {
-    res.status(500).json({ error: "Could not send reply" });
-  }
+  const story = await Story.findById(req.params.id);
+  story.replies.push({ senderName: req.user.name, text: req.body.text });
+  await story.save();
+  await new DirectMessage({ senderId: req.user.userId, receiverId: story.authorId, text: `Replied to story: ${req.body.text}` }).save();
+  res.json(story);
 });
 
 app.post('/api/posts/:id/like', verifyToken, async (req, res) => {
@@ -254,11 +213,7 @@ app.post('/api/posts/:id/like', verifyToken, async (req, res) => {
 app.post('/api/posts/:id/comment', verifyToken, async (req, res) => {
   const user = await User.findById(req.user.userId);
   const post = await Post.findById(req.params.id);
-  post.comments.push({
-    authorName: user.fullName,
-    authorPic: user.profilePic,
-    text: req.body.text
-  });
+  post.comments.push({ authorName: user.fullName, authorPic: user.profilePic, text: req.body.text });
   await post.save();
   res.json(post);
 });
@@ -274,18 +229,13 @@ app.get('/api/groups/:id', verifyToken, async (req, res) => {
 
 app.post('/api/groups/create', verifyToken, async (req, res) => {
   const joinCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-  const group = await new Group({
-    name: req.body.name,
-    adminId: req.user.userId,
-    members: [req.user.userId],
-    joinCode
-  }).save();
+  const group = await new Group({ name: req.body.name, adminId: req.user.userId, members: [req.user.userId], joinCode }).save();
   res.status(201).json(group);
 });
 
 app.post('/api/groups/join', verifyToken, async (req, res) => {
   const group = await Group.findOne({ joinCode: req.body.joinCode });
-  if (!group) return res.status(404).json({ error: "Invalid invite code" });
+  if (!group) return res.status(404).json({ error: "Invalid code" });
   if (!group.members.includes(req.user.userId)) {
     group.members.push(req.user.userId);
     await group.save();
@@ -305,16 +255,14 @@ app.get('/api/messages/direct/:userId', verifyToken, async (req, res) => {
     ]
   }).sort({ createdAt: -1 });
 
-  // Mark all unread incoming messages as read
   await DirectMessage.updateMany(
     { senderId: req.params.userId, receiverId: req.user.userId, status: { $ne: 'read' } },
     { $set: { status: 'read' } }
   );
-
   res.json(msgs);
 });
 
-// --- SOCKET.IO REAL-TIME TICK & CHAT SYSTEM ---
+// --- SOCKET.IO ---
 io.on('connection', (socket) => {
   socket.on('join_room', (roomId) => socket.join(roomId));
 
@@ -322,19 +270,20 @@ io.on('connection', (socket) => {
   socket.on('send_group_message', async (data) => {
     try {
       const decoded = jwt.verify(data.token, process.env.JWT_SECRET);
+      const user = await User.findById(decoded.userId); // Fetch sender profile pic
       const msg = await new Message({
         groupId: data.groupId,
         senderId: decoded.userId,
         senderName: decoded.name,
+        senderPic: user.profilePic, // Attached Profile Pic for Group Chat
         text: data.text || "",
         image: data.image || "",
-        fileName: data.fileName || "",
         status: 'delivered'
       }).save();
+      
+      // Emit to group, including sender to trigger Unread Bubbles
       io.to(data.groupId).emit('receive_group_message', msg);
-    } catch (err) {
-      console.error("Socket Auth Error");
-    }
+    } catch (err) { console.error("Socket Auth Error"); }
   });
 
   // Direct Messages
@@ -346,18 +295,14 @@ io.on('connection', (socket) => {
         receiverId: data.receiverId,
         text: data.text || "",
         image: data.image || "",
-        fileName: data.fileName || "",
         status: 'delivered'
       }).save();
 
       io.to(data.receiverId).emit('receive_dm', msg);
       io.to(decoded.userId).emit('receive_dm', msg);
-    } catch (err) {
-      console.error("DM Auth Error");
-    }
+    } catch (err) { console.error("DM Auth Error"); }
   });
 
-  // Mark Read Status Event
   socket.on('mark_dm_read', async (data) => {
     try {
       await DirectMessage.updateMany(
@@ -365,30 +310,22 @@ io.on('connection', (socket) => {
         { $set: { status: 'read' } }
       );
       io.to(data.senderId).emit('dm_read_receipt', { receiverId: data.receiverId });
-    } catch (err) {
-      console.error(err);
-    }
+    } catch (err) {}
   });
 
-  // Cast Vote
   socket.on('cast_vote', async (data) => {
     try {
       const decoded = jwt.verify(data.token, process.env.JWT_SECRET);
       await new Vote({
-        groupId: data.groupId,
-        voterId: decoded.userId,
-        voterName: decoded.name,
-        suspectId: data.suspectId,
-        suspectName: data.suspectName
+        groupId: data.groupId, voterId: decoded.userId, voterName: decoded.name,
+        suspectId: data.suspectId, suspectName: data.suspectName
       }).save();
       io.to(data.groupId).emit('vote_registered', { message: `${decoded.name} locked in their vote.` });
-    } catch (err) {
-      console.error("Vote Error");
-    }
+    } catch (err) {}
   });
 });
 
-// --- CRON: Daily Game Engine (Runs at 6:00 AM IST) ---
+// --- CRON: Daily Game Engine ---
 cron.schedule('0 6 * * *', async () => {
   try {
     const groups = await Group.find({ 'members.3': { $exists: true } });
@@ -397,18 +334,11 @@ cron.schedule('0 6 * * *', async () => {
       group.currentShadows = shuffled.slice(0, 2);
       group.gameActive = true;
       await group.save();
-
       io.to(group._id.toString()).emit('receive_group_message', {
-        groupId: group._id,
-        senderName: "SYSTEM",
-        text: "The Daily Shadow Hunt has begun! 2 Shadows are hiding among you.",
-        createdAt: new Date(),
-        status: 'delivered'
+        groupId: group._id, senderName: "SYSTEM", text: "The Daily Shadow Hunt has begun! 2 Shadows are hiding.", status: 'delivered'
       });
     }
-  } catch (err) {
-    console.error("Cron Job Error:", err);
-  }
+  } catch (err) {}
 });
 
 const PORT = process.env.PORT || 10000;
