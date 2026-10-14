@@ -23,9 +23,9 @@ mongoose.connect(process.env.MONGO_URI)
 // --- SCHEMAS ---
 const UserSchema = new mongoose.Schema({
   fullName: { type: String, required: true },
-  email: { type: String, required: true, unique: true }, // Defaults to a safe fake email if using phone
+  email: { type: String, required: true, unique: true },
   phoneNumber: { type: String, default: "" },
-  password: { type: String, required: true }, // Storing hashed OTP to maintain schema integrity
+  password: { type: String, required: true },
   profilePic: { type: String, default: "" },
   fcmToken: { type: String, default: "" },
   xp: { type: Number, default: 0 },
@@ -36,7 +36,7 @@ const User = mongoose.model('User', UserSchema);
 const OTPSchema = new mongoose.Schema({
   identifier: { type: String, required: true },
   otp: { type: String, required: true },
-  createdAt: { type: Date, expires: 600, default: Date.now } // Expires in 10 mins
+  createdAt: { type: Date, expires: 600, default: Date.now }
 });
 const OTP = mongoose.model('OTP', OTPSchema);
 
@@ -59,6 +59,8 @@ const MessageSchema = new mongoose.Schema({
   image: { type: String, default: "" },
   fileUrl: { type: String, default: "" },
   fileName: { type: String, default: "" },
+  replyToText: { type: String, default: "" },
+  replyToSender: { type: String, default: "" },
   status: { type: String, enum: ['sent', 'delivered', 'read'], default: 'sent' },
   readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   createdAt: { type: Date, default: Date.now }
@@ -72,6 +74,8 @@ const DirectMessageSchema = new mongoose.Schema({
   image: { type: String, default: "" },
   fileUrl: { type: String, default: "" },
   fileName: { type: String, default: "" },
+  replyToText: { type: String, default: "" },
+  replyToSender: { type: String, default: "" },
   status: { type: String, enum: ['sent', 'delivered', 'read'], default: 'sent' },
   createdAt: { type: Date, default: Date.now }
 });
@@ -114,33 +118,26 @@ const Vote = mongoose.model('Vote', VoteSchema);
 const verifyToken = (req, res, next) => {
   const token = req.header('Authorization');
   if (!token) return res.status(401).json({ error: "Access denied." });
-  try {
-    req.user = jwt.verify(token.replace('Bearer ', ''), process.env.JWT_SECRET);
-    next();
-  } catch (err) { res.status(400).json({ error: "Invalid token." }); }
+  try { req.user = jwt.verify(token.replace('Bearer ', ''), process.env.JWT_SECRET); next(); }
+  catch (err) { res.status(400).json({ error: "Invalid token." }); }
 };
 
-// --- AUTH & OTP SYSTEM (WhatsApp Style) ---
+// --- AUTH & STATS ---
+app.get('/api/stats', async (req, res) => {
+  try { res.json({ totalUsers: await User.countDocuments() }); } 
+  catch (err) { res.json({ totalUsers: 0 }); }
+});
+
 app.post('/api/auth/request-otp', async (req, res) => {
   try {
     let { identifier } = req.body;
     identifier = identifier.trim().toLowerCase();
-    
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    
-    // Simulate sending via WhatsApp/SMS/Email
     console.log(`\n========================================`);
-    console.log(`📲 [WHO2 OTP DISPATCHER]`);
-    console.log(`To: ${identifier} (WhatsApp, SMS, Email)`);
-    console.log(`OTP CODE: ${otp}`);
+    console.log(`📲 [WHO2 OTP] To: ${identifier} | CODE: ${otp}`);
     console.log(`========================================\n`);
-
-    await OTP.findOneAndUpdate(
-      { identifier },
-      { otp, createdAt: new Date() },
-      { upsert: true, new: true }
-    );
-    res.json({ message: "OTP sent via WhatsApp, SMS, and Email.", devOtp: otp }); // devOtp sent back just for your easy testing!
+    await OTP.findOneAndUpdate({ identifier }, { otp, createdAt: new Date() }, { upsert: true, new: true });
+    res.json({ message: "OTP sent.", devOtp: otp });
   } catch (err) { res.status(500).json({ error: "Failed to generate OTP" }); }
 });
 
@@ -148,45 +145,31 @@ app.post('/api/auth/verify-otp', async (req, res) => {
   try {
     let { identifier, otp, fullName } = req.body;
     identifier = identifier.trim().toLowerCase();
-    
     const record = await OTP.findOne({ identifier, otp });
     if (!record) return res.status(400).json({ error: "Invalid or expired OTP." });
 
     const isEmail = identifier.includes('@');
-    const cleanPhone = isEmail ? "" : identifier.replace(/\D/g, ''); // Extract only numbers
+    const cleanPhone = isEmail ? "" : identifier.replace(/\D/g, '');
     const derivedEmail = isEmail ? identifier : `${cleanPhone}@who2.mobile`;
 
-    let user = await User.findOne({
-      $or: [{ email: derivedEmail }, { phoneNumber: cleanPhone.length > 0 ? cleanPhone : "INVALID_MATCH" }]
-    });
+    let user = await User.findOne({ $or: [{ email: derivedEmail }, { phoneNumber: cleanPhone.length > 0 ? cleanPhone : "INVALID_MATCH" }] });
 
     if (!user) {
       if (!fullName) return res.status(400).json({ error: "Full name required for new registration" });
-      user = await new User({
-        fullName,
-        email: derivedEmail,
-        phoneNumber: cleanPhone,
-        password: await bcrypt.hash(otp, 10) 
-      }).save();
+      user = await new User({ fullName, email: derivedEmail, phoneNumber: cleanPhone, password: await bcrypt.hash(otp, 10) }).save();
     }
-
     await OTP.deleteOne({ _id: record._id });
     const token = jwt.sign({ userId: user._id, name: user.fullName }, process.env.JWT_SECRET);
-    res.json({ token, user: { id: user._id, name: user.fullName, email: user.email, phoneNumber: user.phoneNumber, profilePic: user.profilePic, xp: user.xp, streak: user.streak } });
+    res.json({ token, user: { id: user._id, name: user.fullName, email: user.email, profilePic: user.profilePic, xp: user.xp, streak: user.streak } });
   } catch (err) { res.status(500).json({ error: "Verification failed" }); }
 });
 
-// --- CONTACTS SYNC ---
+// --- CONTACTS & PROFILE ---
 app.post('/api/contacts/sync', verifyToken, async (req, res) => {
   try {
-    const { phones, emails } = req.body;
-    const cleanPhones = phones.map(p => p.replace(/\D/g, ''));
-    
-    const registeredUsers = await User.find({
-      _id: { $ne: req.user.userId },$or: [{ phoneNumber: { $in: cleanPhones } }, { email: {$in: emails } }]
-    }).select('fullName phoneNumber email profilePic _id');
-    
-    res.json(registeredUsers);
+    const cleanPhones = req.body.phones.map(p => p.replace(/\D/g, ''));
+    const users = await User.find({ _id: { $ne: req.user.userId },$or: [{ phoneNumber: { $in: cleanPhones } }, { email: {$in: req.body.emails } }] }).select('fullName phoneNumber email profilePic _id');
+    res.json(users);
   } catch (err) { res.status(500).json({ error: "Contact sync failed" }); }
 });
 
@@ -195,7 +178,16 @@ app.put('/api/profile/picture', verifyToken, async (req, res) => {
   const user = await User.findByIdAndUpdate(req.user.userId, { profilePic: req.body.profilePic }, { new: true }).select('-password');
   res.json(user);
 });
-app.get('/api/users', verifyToken, async (req, res) => res.json(await User.find({ _id: { $ne: req.user.userId } }).select('fullName email profilePic _id')));
+
+// Database-backed Unread Bubbles Calculation
+app.get('/api/users', verifyToken, async (req, res) => {
+  const users = await User.find({ _id: { $ne: req.user.userId } }).select('fullName email profilePic _id');
+  const result = await Promise.all(users.map(async u => {
+    const unread = await DirectMessage.countDocuments({ senderId: u._id, receiverId: req.user.userId, status: { $ne: 'read' } });
+    return { ...u._doc, unreadCount: unread };
+  }));
+  res.json(result);
+});
 
 // --- FEED & STORIES ---
 app.get('/api/feed', verifyToken, async (req, res) => {
@@ -207,6 +199,12 @@ app.post('/api/posts', verifyToken, async (req, res) => {
   const user = await User.findById(req.user.userId);
   const post = await new Post({ authorId: user._id, authorName: user.fullName, authorPic: user.profilePic, content: req.body.content, image: req.body.image }).save();
   res.status(201).json(post);
+});
+app.delete('/api/posts/:id', verifyToken, async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.authorId.toString() !== req.user.userId) return res.status(403).json({ error: "Unauthorized" });
+  await Post.findByIdAndDelete(req.params.id);
+  res.json({ success: true });
 });
 app.post('/api/stories', verifyToken, async (req, res) => {
   const user = await User.findById(req.user.userId);
@@ -245,7 +243,7 @@ app.post('/api/groups/create', verifyToken, async (req, res) => {
 });
 app.post('/api/groups/join', verifyToken, async (req, res) => {
   const group = await Group.findOne({ joinCode: req.body.joinCode });
-  if (!group) return res.status(404).json({ error: "Invalid invite code" });
+  if (!group) return res.status(404).json({ error: "Invalid code" });
   if (!group.members.includes(req.user.userId)) { group.members.push(req.user.userId); await group.save(); }
   res.json(group);
 });
@@ -268,7 +266,8 @@ io.on('connection', (socket) => {
       const user = await User.findById(decoded.userId);
       const msg = await new Message({
         groupId: data.groupId, senderId: decoded.userId, senderName: decoded.name, senderPic: user.profilePic,
-        text: data.text || "", image: data.image || "", fileUrl: data.fileData || "", fileName: data.fileName || "", status: 'delivered'
+        text: data.text || "", image: data.image || "", fileUrl: data.fileData || "", fileName: data.fileName || "",
+        replyToText: data.replyToText || "", replyToSender: data.replyToSender || "", status: 'delivered'
       }).save();
       io.to(data.groupId).emit('receive_group_message', msg);
     } catch (err) {}
@@ -279,7 +278,8 @@ io.on('connection', (socket) => {
       const decoded = jwt.verify(data.token, process.env.JWT_SECRET);
       const msg = await new DirectMessage({
         senderId: decoded.userId, receiverId: data.receiverId,
-        text: data.text || "", image: data.image || "", fileUrl: data.fileData || "", fileName: data.fileName || "", status: 'delivered'
+        text: data.text || "", image: data.image || "", fileUrl: data.fileData || "", fileName: data.fileName || "",
+        replyToText: data.replyToText || "", replyToSender: data.replyToSender || "", status: 'delivered'
       }).save();
       io.to(data.receiverId).emit('receive_dm', msg);
       io.to(decoded.userId).emit('receive_dm', msg);
