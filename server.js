@@ -400,11 +400,30 @@ app.delete('/api/fcm-token', auth, wrap(async (req, res) => {
   if (t) await User.updateOne({ _id: req.user.userId }, { $pull: { fcmTokens: t } });
   res.json({ ok: true });
 }));
-app.get('/api/ice', auth, (req, res) => {
+app.get('/api/ice', auth, wrap(async (req, res) => {
   const iceServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
-  if (process.env.TURN_URLS) iceServers.push({ urls: process.env.TURN_URLS.split(','), username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
+  // Option A (recommended): Metered.ca TURN – free account, set METERED_DOMAIN + METERED_API_KEY
+  if (process.env.METERED_DOMAIN && process.env.METERED_API_KEY) {
+    try {
+      const r = await fetch(`https://${process.env.METERED_DOMAIN}/api/v1/turn/credentials?apiKey=${process.env.METERED_API_KEY}`);
+      if (r.ok) {
+        const list = await r.json();
+        if (Array.isArray(list) && list.length) return res.json({ iceServers: list });
+      }
+    } catch (e) { console.error('Metered TURN fetch failed:', e.message); }
+  }
+  // Option B: your own TURN server (coturn, Twilio, ...)
+  if (process.env.TURN_URLS) {
+    iceServers.push({ urls: process.env.TURN_URLS.split(','), username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
+  } else if (process.env.DISABLE_PUBLIC_TURN !== 'true') {
+    // Option C (testing only): shared public relay so calls work between different networks out of the box.
+    iceServers.push({
+      urls: ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443', 'turn:openrelay.metered.ca:443?transport=tcp', 'turns:openrelay.metered.ca:443?transport=tcp'],
+      username: 'openrelayproject', credential: 'openrelayproject',
+    });
+  }
   res.json({ iceServers });
-});
+}));
 
 app.post('/api/contacts/sync', auth, wrap(async (req, res) => {
   const phones = [...new Set((req.body.phones || []).map(digits).filter((p) => p.length >= 8))].slice(0, 6000);
@@ -744,8 +763,8 @@ io.on('connection', async (socket) => {
     try {
       const g = await Group.findOne({ _id: d.groupId, members: me }).select('name members');
       if (!g) throw new Error('Not a member');
-      const u = await User.findById(me).select('picVersion');
-      const msg = await Message.create({ ...bodyFrom(d), groupId: g._id, senderId: me, senderName: socket.user.name, senderPicV: u?.picVersion || 0, status: 'delivered' });
+      const u = await User.findById(me).select('picVersion fullName');
+      const msg = await Message.create({ ...bodyFrom(d), groupId: g._id, senderId: me, senderName: (u && u.fullName) || socket.user.name, senderPicV: u?.picVersion || 0, status: 'delivered' });
       const out = shape(msg);
       out.groupName = g.name;
       io.to(String(g._id)).emit('receive_group_message', out);
@@ -864,6 +883,10 @@ io.on('connection', async (socket) => {
       const now = new Date();
       await User.updateOne({ _id: me }, { lastSeen: now }).catch(() => {});
       io.to('p:' + me).emit('presence', { userId: me, online: false, lastSeen: now });
+      setTimeout(() => {
+        if (isOnline(me)) return;
+        for (const [id, c] of activeCalls) if (c.from === me || c.to === me) endCall(id, null, me);
+      }, 15000);
     }
   });
 });
